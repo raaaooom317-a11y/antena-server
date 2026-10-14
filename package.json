@@ -1,0 +1,13 @@
+{
+  "name": "antena-server",
+  "version": "1.0.0",
+  "description": "Servidor de control para la antena",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "socket.io": "^4.8.4"
+  }
+}
