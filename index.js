@@ -11,21 +11,11 @@ const io = new Server(server, {
 
 let receptorConnected = false;
 
-// ==========================================
-// RUTA HTTP PARA EVITAR EL ERROR 404
-// ==========================================
+// Ruta raíz simplificada para Railway
 app.get('/', (req, res) => {
-  res.status(200).send('¡Servidor de Antena Receptor 1 Activo y Operativo!');
+  res.send('OK');
 });
 
-// Ruta adicional para chequeos de salud
-app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'online', receptorConnected });
-});
-
-// ==========================================
-// CONFIGURACIÓN DE SOCKET.IO
-// ==========================================
 io.on('connection', (socket) => {
   console.log(`[+] Dispositivo conectado: ${socket.id}`);
 
@@ -47,7 +37,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('antena_data', (data) => {
-    console.log('[📡] Datos de pantalla recibidos de la emisora:', data);
+    console.log('[📡] Datos recibidos:', data);
     io.emit('receive_antena_data', data);
   });
 
@@ -61,11 +51,8 @@ io.on('connection', (socket) => {
   });
 });
 
-// ==========================================
-// PUERTO Y ARRANQUE PARA RAILWAY
-// ==========================================
 const PORT = process.env.PORT || 3000;
 
 server.listen(PORT, () => {
-  console.log(`Servidor corriendo en el puerto ${PORT}`);
+  console.log(`Servidor activo en puerto ${PORT}`);
 });
