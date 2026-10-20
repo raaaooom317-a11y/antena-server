@@ -11,6 +11,21 @@ const io = new Server(server, {
 
 let receptorConnected = false;
 
+// ==========================================
+// RUTA HTTP PARA EVITAR EL ERROR 404
+// ==========================================
+app.get('/', (req, res) => {
+  res.status(200).send('¡Servidor de Antena Receptor 1 Activo y Operativo!');
+});
+
+// Ruta adicional opcional para chequeos de salud
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'online', receptorConnected });
+});
+
+// ==========================================
+// CONFIGURACIÓN DE SOCKET.IO
+// ==========================================
 io.on('connection', (socket) => {
   console.log(`[+] Dispositivo conectado: ${socket.id}`);
 
@@ -46,8 +61,8 @@ io.on('connection', (socket) => {
   });
 });
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Servidor de la Antena corriendo en http://0.0.0.0:${PORT}`);
+  console.log(`Servidor de la Antena corriendo en el puerto ${PORT}`);
 });
