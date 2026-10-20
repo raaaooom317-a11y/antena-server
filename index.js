@@ -18,7 +18,7 @@ app.get('/', (req, res) => {
   res.status(200).send('¡Servidor de Antena Receptor 1 Activo y Operativo!');
 });
 
-// Ruta adicional opcional para chequeos de salud
+// Ruta adicional para chequeos de salud
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'online', receptorConnected });
 });
@@ -61,6 +61,14 @@ io.on('connection', (socket) => {
   });
 });
 
+// ==========================================
+// PUERTO Y ARRANQUE PARA RAILWAY
+// ==========================================
+const PORT = process.env.PORT || 3000;
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`Servidor escuchando en el puerto ${PORT}`);
+});
 const PORT = process.env.PORT || 3000;
 
 server.listen(PORT, () => {
