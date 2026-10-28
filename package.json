@@ -1,13 +1,21 @@
 {
   "name": "antena-server",
   "version": "1.0.0",
-  "description": "Servidor de control para la antena",
+  "description": "Rendezvous seguro de Antena Remote AI",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "dependencies": {
-    "express": "^4.21.2",
-    "socket.io": "^4.8.4"
+    "express": "5.2.1",
+    "pg": "8.16.3",
+    "socket.io": "4.8.4"
+  },
+  "devDependencies": {
+    "socket.io-client": "4.8.4"
   }
 }

@@ -1,62 +1,45 @@
-const express = require('express');
-const http = require('http');
+const http = require('node:http');
 const { Server } = require('socket.io');
-const cors = require('cors');
+const { createApplication, createPresence, installSocketAuthentication } = require('./app');
+const { PostgresStore } = require('./store');
 
-const app = express();
-app.use(cors());
+async function start() {
+  const store = await PostgresStore.connect(process.env.DATABASE_URL);
+  const httpServer = http.createServer();
+  const io = new Server(httpServer, {
+    cors: process.env.WEB_ORIGIN ? { origin: process.env.WEB_ORIGIN } : { origin: false },
+    maxHttpBufferSize: 16 * 1024,
+  });
+  const presence = createPresence(io, store);
+  installSocketAuthentication(io, store, presence);
+  httpServer.on('request', createApplication({ store, io, presence }));
 
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
-  }
-});
+  const cleanup = setInterval(() => {
+    store.pruneExpired().catch((error) => {
+      console.error(`Expired record cleanup failed: ${error.message}`);
+    });
+  }, 60 * 60 * 1000);
+  cleanup.unref();
 
-// Ruta de comprobación básica para ver si el servidor está vivo en Railway
-app.get('/', (req, res) => {
-  res.send('Servidor de Antena Control funcionando correctamente 🚀');
-});
-
-// Lógica de conexión tipo TeamViewer / Sala de control
-io.on('connection', (socket) => {
-  console.log(`Dispositivo conectado: ${socket.id}`);
-
-  // 1. El receptor se registra con un ID único o se une a una sala
-  socket.on('registrar-receptor', (deviceId) => {
-    socket.join(deviceId);
-    console.log(`Receptor registrado con ID de sala: ${deviceId}`);
+  const port = Number(process.env.PORT || 3000);
+  httpServer.listen(port, '0.0.0.0', () => {
+    console.log(`Antena Remote AI server listening on port ${port}`);
   });
 
-  // 2. El emisor se conecta a la sala del receptor específico
-  socket.on('conectar-emisor', (deviceId) => {
-    socket.join(deviceId);
-    console.log(`Emisor vinculado al receptor: ${deviceId}`);
-    // Avisar al receptor que alguien se conectó
-    io.to(deviceId).emit('estado-conexion', { status: 'conectado', emisorId: socket.id });
-  });
+  const shutdown = async () => {
+    clearInterval(cleanup);
+    await new Promise((resolve) => io.close(resolve));
+    await store.close();
+  };
+  process.once('SIGTERM', shutdown);
+  process.once('SIGINT', shutdown);
+}
 
-  // 3. Reenviar comandos del Emisor -> Receptor
-  socket.on('enviar-comando', (data) => {
-    // data debe contener { deviceId, comando: {...} }
-    console.log(`Comando enviado al receptor ${data.deviceId}:`, data.comando);
-    io.to(data.deviceId).emit('recibir-comando', data.comando);
+if (require.main === module) {
+  start().catch((error) => {
+    console.error(`Server startup failed: ${error.message}`);
+    process.exitCode = 1;
   });
+}
 
-  // 4. Reenviar telemetría/respuesta del Receptor -> Emisor
-  socket.on('enviar-telemetria', (data) => {
-    // data debe contener { deviceId, telemetria: {...} }
-    io.to(data.deviceId).emit('recibir-telemetria', data.telemetria);
-  });
-
-  socket.on('disconnect', () => {
-    console.log(`Dispositivo desconectado: ${socket.id}`);
-  });
-});
-
-// Railway asigna un puerto dinámico mediante process.env.PORT
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Servidor corriendo en el puerto ${PORT}`);
-});
+module.exports = { start };
