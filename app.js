@@ -59,6 +59,52 @@ function createRateLimiter({ limit, windowMs }) {
   };
 }
 
+function iceServersFromEnvironment(environment = process.env) {
+  const iceServers = [{ urls: ['stun:stun.l.google.com:19302'] }];
+  const urls = typeof environment.TURN_URL === 'string'
+    ? environment.TURN_URL.split(',').map((url) => url.trim()).filter(Boolean)
+    : [];
+  if (urls.length && environment.TURN_USERNAME && environment.TURN_CREDENTIAL) {
+    iceServers.push({
+      urls,
+      username: environment.TURN_USERNAME,
+      credential: environment.TURN_CREDENTIAL,
+    });
+  }
+  return iceServers;
+}
+
+function isValidScreenSignal(message) {
+  if (!message || typeof message !== 'object' || Array.isArray(message)) return false;
+  if (!UUID_PATTERN.test(message.sessionId || '')) return false;
+  if (message.type === 'offer' || message.type === 'answer') {
+    return Object.keys(message).every((key) => ['sessionId', 'type', 'sdp'].includes(key))
+      && typeof message.sdp === 'string' && message.sdp.length > 0 && message.sdp.length <= 12000;
+  }
+  if (message.type === 'ice-candidate') {
+    const candidate = message.candidate;
+    return Object.keys(message).every((key) => ['sessionId', 'type', 'candidate'].includes(key))
+      && candidate && typeof candidate === 'object' && !Array.isArray(candidate)
+      && Object.keys(candidate).every((key) => ['candidate', 'sdpMid', 'sdpMLineIndex'].includes(key))
+      && typeof candidate.candidate === 'string' && candidate.candidate.length <= 4096
+      && (candidate.sdpMid === null || typeof candidate.sdpMid === 'string')
+      && (candidate.sdpMid === null || candidate.sdpMid.length <= 256)
+      && (candidate.sdpMLineIndex === null
+        || (Number.isInteger(candidate.sdpMLineIndex)
+          && candidate.sdpMLineIndex >= 0 && candidate.sdpMLineIndex <= 65535));
+  }
+  return false;
+}
+
+function publishScreenSessionUpdate(io, session, reason) {
+  if (!session) return;
+  const update = { sessionId: session.session_id || session.sessionId, status: session.status };
+  const updateReason = reason || session.ended_reason;
+  if (updateReason) update.reason = updateReason;
+  io.to(session.helper_id || session.helperId).emit('screen:session_update', update);
+  io.to(session.receiver_id || session.receiverId).emit('screen:session_update', update);
+}
+
 function createApplication({ store, io, presence }) {
   const app = express();
   app.disable('x-powered-by');
@@ -304,10 +350,13 @@ function createApplication({ store, io, presence }) {
         return sendError(response, 400, 'invalid_device_id', 'El identificador no es válido.');
       }
       const revoked = await store.revokeHelper({ ownerId: request.device.device_id, helperId });
-      if (!revoked) {
+      if (!revoked?.revoked) {
         return sendError(response, 404, 'device_not_linked', 'Ese dispositivo no está autorizado.');
       }
       io.to(helperId).emit('trust_revoked', { receiverId: request.device.device_id });
+      for (const session of revoked.endedSessions) {
+        publishScreenSessionUpdate(io, session, 'trust_revoked');
+      }
       return response.status(204).end();
     } catch (error) {
       return next(error);
@@ -388,6 +437,118 @@ function createApplication({ store, io, presence }) {
     }
   });
 
+  app.post('/api/v1/screen-sessions', actionRateLimit, async (request, response, next) => {
+    try {
+      const { assistanceRequestId } = request.body || {};
+      if (typeof assistanceRequestId !== 'string' || !UUID_PATTERN.test(assistanceRequestId)) {
+        return sendError(response, 400, 'invalid_assistance_request', 'La solicitud de asistencia no es válida.');
+      }
+      const expiresAt = new Date(Date.now() + 30 * 60 * 1000);
+      const session = await store.createScreenSession({
+        sessionId: crypto.randomUUID(),
+        assistanceRequestId,
+        expiresAt,
+      });
+      if (!session) {
+        return sendError(response, 403, 'not_authorized', 'La asistencia aceptada o la autorización vigente no existe.');
+      }
+      const helper = await store.getDevice(session.helper_id);
+      io.to(session.receiver_id).emit('screen:session_request', {
+        sessionId: session.session_id,
+        helperId: session.helper_id,
+        helperName: helper.display_name,
+        expiresAt: session.expires_at,
+      });
+      publishScreenSessionUpdate(io, session);
+      return response.status(201).json({
+        sessionId: session.session_id,
+        helperId: session.helper_id,
+        receiverId: session.receiver_id,
+        status: session.status,
+      });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.post('/api/v1/screen-sessions/:sessionId/respond', async (request, response, next) => {
+    try {
+      const { sessionId } = request.params;
+      const { accepted } = request.body || {};
+      if (!UUID_PATTERN.test(sessionId) || typeof accepted !== 'boolean') {
+        return sendError(response, 400, 'invalid_response', 'La respuesta a la sesión no es válida.');
+      }
+      const session = await store.respondScreenSession({
+        sessionId,
+        receiverId: request.device.device_id,
+        accepted,
+      });
+      if (!session) {
+        return sendError(response, 404, 'session_not_found', 'La sesión expiró, no existe o no pertenece a este dispositivo.');
+      }
+      publishScreenSessionUpdate(io, session, accepted ? undefined : 'rejected');
+      return response.json({ sessionId, status: session.status });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.post('/api/v1/screen-sessions/:sessionId/activate', async (request, response, next) => {
+    try {
+      const { sessionId } = request.params;
+      if (!UUID_PATTERN.test(sessionId)) {
+        return sendError(response, 400, 'invalid_session_id', 'La sesión no es válida.');
+      }
+      const session = await store.activateScreenSession({
+        sessionId,
+        receiverId: request.device.device_id,
+      });
+      if (!session) {
+        return sendError(response, 404, 'session_not_found', 'La sesión no está aceptada o no pertenece a este dispositivo.');
+      }
+      publishScreenSessionUpdate(io, session);
+      return response.json({ sessionId, status: session.status });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.post('/api/v1/screen-sessions/:sessionId/end', async (request, response, next) => {
+    try {
+      const { sessionId } = request.params;
+      if (!UUID_PATTERN.test(sessionId)) {
+        return sendError(response, 400, 'invalid_session_id', 'La sesión no es válida.');
+      }
+      const session = await store.endScreenSession({
+        sessionId,
+        deviceId: request.device.device_id,
+      });
+      if (!session) {
+        return sendError(response, 404, 'session_not_found', 'La sesión no existe, ya terminó o no pertenece a este dispositivo.');
+      }
+      publishScreenSessionUpdate(io, session, 'ended');
+      return response.json({ sessionId, status: session.status });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.get('/api/v1/screen-sessions/:sessionId/ice-servers', async (request, response, next) => {
+    try {
+      const { sessionId } = request.params;
+      if (!UUID_PATTERN.test(sessionId)) {
+        return sendError(response, 400, 'invalid_session_id', 'La sesión no es válida.');
+      }
+      const session = await store.getScreenSessionForParticipant(sessionId, request.device.device_id);
+      if (!session) {
+        return sendError(response, 404, 'session_not_found', 'La sesión no existe, expiró o no pertenece a este dispositivo.');
+      }
+      return response.json({ iceServers: iceServersFromEnvironment() });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
   app.use((request, response) => {
     sendError(response, 404, 'not_found', 'La ruta solicitada no existe.');
   });
@@ -439,6 +600,8 @@ function createPresence(io, store) {
       sockets.delete(socketId);
       if (sockets.size) return;
       connected.delete(deviceId);
+      const endedSessions = await store.endScreenSessionsForDevice(deviceId);
+      for (const session of endedSessions) publishScreenSessionUpdate(io, session, 'disconnected');
       const helpers = await store.listHelpersForReceiver(deviceId);
       for (const helperId of helpers) {
         io.to(helperId).emit('device_status', { deviceId, online: false });
@@ -504,6 +667,32 @@ function installSocketAuthentication(io, store, presence) {
       socket.disconnect(true);
       return;
     }
+    socket.on('screen:signal', async (message, acknowledge) => {
+      const reject = () => {
+        if (typeof acknowledge === 'function') acknowledge({ ok: false, error: 'not_authorized' });
+      };
+      if (!isValidScreenSignal(message)) {
+        if (typeof acknowledge === 'function') acknowledge({ ok: false, error: 'invalid_signal' });
+        return;
+      }
+      try {
+        const session = await store.getActiveScreenSession(message.sessionId);
+        if (!session) return reject();
+        const isHelper = session.helper_id === deviceId;
+        const isReceiver = session.receiver_id === deviceId;
+        if ((!isHelper && !isReceiver)
+          || (message.type === 'offer' && !isHelper)
+          || (message.type === 'answer' && !isReceiver)) return reject();
+        const peerId = isHelper ? session.receiver_id : session.helper_id;
+        const relay = message.type === 'ice-candidate'
+          ? { sessionId: message.sessionId, type: message.type, candidate: message.candidate }
+          : { sessionId: message.sessionId, type: message.type, sdp: message.sdp };
+        io.to(peerId).emit('screen:signal', relay);
+        if (typeof acknowledge === 'function') acknowledge({ ok: true });
+      } catch {
+        reject();
+      }
+    });
     socket.on('disconnect', () => {
       clearTimeout(expiryTimer);
       presence.detach(deviceId, socket.id).catch((error) => {
@@ -517,5 +706,7 @@ module.exports = {
   createApplication,
   createPresence,
   installSocketAuthentication,
+  iceServersFromEnvironment,
+  publishScreenSessionUpdate,
   publicKeyFromBase64,
 };

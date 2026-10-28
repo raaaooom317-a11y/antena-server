@@ -1,6 +1,11 @@
 const http = require('node:http');
 const { Server } = require('socket.io');
-const { createApplication, createPresence, installSocketAuthentication } = require('./app');
+const {
+  createApplication,
+  createPresence,
+  installSocketAuthentication,
+  publishScreenSessionUpdate,
+} = require('./app');
 const { PostgresStore } = require('./store');
 
 async function start() {
@@ -15,10 +20,12 @@ async function start() {
   httpServer.on('request', createApplication({ store, io, presence }));
 
   const cleanup = setInterval(() => {
-    store.pruneExpired().catch((error) => {
+    store.pruneExpired().then((endedSessions) => {
+      for (const session of endedSessions) publishScreenSessionUpdate(io, session, 'expired');
+    }).catch((error) => {
       console.error(`Expired record cleanup failed: ${error.message}`);
     });
-  }, 60 * 60 * 1000);
+  }, 30 * 1000);
   cleanup.unref();
 
   const port = Number(process.env.PORT || 3000);
