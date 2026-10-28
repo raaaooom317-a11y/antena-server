@@ -15,8 +15,13 @@ class PostgresStore {
     const pool = new Pool({ connectionString, max: 10 });
     const store = new PostgresStore(pool);
     const schema = fs.readFileSync(path.join(__dirname, 'db', 'schema.sql'), 'utf8');
+    const screenSessionsMigration = fs.readFileSync(
+      path.join(__dirname, 'db', 'migrations', '001_screen_sessions.sql'),
+      'utf8'
+    );
     try {
       await pool.query(schema);
+      await pool.query(screenSessionsMigration);
     } catch (error) {
       await pool.end();
       throw error;
@@ -277,7 +282,7 @@ class PostgresStore {
       );
       if (result.rowCount !== 1) {
         await client.query('ROLLBACK');
-        return false;
+        return { revoked: false, endedSessions: [] };
       }
       await client.query(
         `UPDATE antena_assistance_requests
@@ -286,8 +291,16 @@ class PostgresStore {
            AND status IN ('pending', 'accepted')`,
         [ownerId, helperId]
       );
+      const ended = await client.query(
+        `UPDATE antena_screen_sessions
+         SET status = 'ended', ended_reason = 'trust_revoked'
+         WHERE receiver_id = $1 AND helper_id = $2
+           AND status IN ('pending', 'accepted', 'active')
+         RETURNING session_id, helper_id, receiver_id, status, ended_reason`,
+        [ownerId, helperId]
+      );
       await client.query('COMMIT');
-      return true;
+      return { revoked: true, endedSessions: ended.rows };
     } catch (error) {
       await client.query('ROLLBACK');
       throw error;
@@ -338,6 +351,207 @@ class PostgresStore {
     return result.rows[0] || null;
   }
 
+  async createScreenSession({ sessionId, assistanceRequestId, expiresAt }) {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const participantResult = await client.query(
+        `SELECT helper_id, receiver_id
+         FROM antena_assistance_requests
+         WHERE request_id = $1 AND status = 'accepted'`,
+        [assistanceRequestId]
+      );
+      if (participantResult.rowCount !== 1) {
+        await client.query('ROLLBACK');
+        return null;
+      }
+      const participant = participantResult.rows[0];
+      const trust = await client.query(
+        `SELECT owner_id FROM antena_trusted_devices
+         WHERE owner_id = $1 AND helper_id = $2 FOR UPDATE`,
+        [participant.receiver_id, participant.helper_id]
+      );
+      if (trust.rowCount !== 1) {
+        await client.query('ROLLBACK');
+        return null;
+      }
+      const accepted = await client.query(
+        `SELECT request_id FROM antena_assistance_requests
+         WHERE request_id = $1 AND helper_id = $2 AND receiver_id = $3 AND status = 'accepted'`,
+        [assistanceRequestId, participant.helper_id, participant.receiver_id]
+      );
+      if (accepted.rowCount !== 1) {
+        await client.query('ROLLBACK');
+        return null;
+      }
+      const result = await client.query(
+        `INSERT INTO antena_screen_sessions (
+           session_id, assistance_request_id, helper_id, receiver_id, status, expires_at
+         ) VALUES ($1, $2, $3, $4, 'pending', $5)
+         RETURNING session_id, helper_id, receiver_id, status, expires_at`,
+        [sessionId, assistanceRequestId, participant.helper_id, participant.receiver_id, expiresAt]
+      );
+      await client.query('COMMIT');
+      return result.rows[0] || null;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async respondScreenSession({ sessionId, receiverId, accepted }) {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const participant = await client.query(
+        `SELECT helper_id FROM antena_screen_sessions
+         WHERE session_id = $1 AND receiver_id = $2 AND status = 'pending'`,
+        [sessionId, receiverId]
+      );
+      if (participant.rowCount !== 1) {
+        await client.query('ROLLBACK');
+        return null;
+      }
+      const trust = await client.query(
+        `SELECT owner_id FROM antena_trusted_devices
+         WHERE owner_id = $1 AND helper_id = $2 FOR UPDATE`,
+        [receiverId, participant.rows[0].helper_id]
+      );
+      const current = trust.rowCount === 1 ? await client.query(
+        `SELECT s.session_id
+         FROM antena_screen_sessions s
+         JOIN antena_assistance_requests a ON a.request_id = s.assistance_request_id
+         WHERE s.session_id = $1 AND s.receiver_id = $2 AND s.status = 'pending'
+           AND s.expires_at > NOW() AND a.status = 'accepted'
+         FOR UPDATE OF s`,
+        [sessionId, receiverId]
+      ) : { rowCount: 0 };
+      if (current.rowCount !== 1) {
+        await client.query('ROLLBACK');
+        return null;
+      }
+      const result = await client.query(
+        `UPDATE antena_screen_sessions
+         SET status = CASE WHEN $2 THEN 'accepted' ELSE 'rejected' END,
+             ended_reason = CASE WHEN $2 THEN NULL ELSE 'rejected' END
+         WHERE session_id = $1
+         RETURNING session_id, helper_id, receiver_id, status`,
+        [sessionId, accepted]
+      );
+      await client.query('COMMIT');
+      return result.rows[0] || null;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async activateScreenSession({ sessionId, receiverId }) {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const participant = await client.query(
+        `SELECT helper_id FROM antena_screen_sessions
+         WHERE session_id = $1 AND receiver_id = $2 AND status = 'accepted'`,
+        [sessionId, receiverId]
+      );
+      if (participant.rowCount !== 1) {
+        await client.query('ROLLBACK');
+        return null;
+      }
+      const trust = await client.query(
+        `SELECT owner_id FROM antena_trusted_devices
+         WHERE owner_id = $1 AND helper_id = $2 FOR UPDATE`,
+        [receiverId, participant.rows[0].helper_id]
+      );
+      const current = trust.rowCount === 1 ? await client.query(
+        `SELECT s.session_id
+         FROM antena_screen_sessions s
+         JOIN antena_assistance_requests a ON a.request_id = s.assistance_request_id
+         WHERE s.session_id = $1 AND s.receiver_id = $2 AND s.status = 'accepted'
+           AND s.expires_at > NOW() AND a.status = 'accepted'
+         FOR UPDATE OF s`,
+        [sessionId, receiverId]
+      ) : { rowCount: 0 };
+      if (current.rowCount !== 1) {
+        await client.query('ROLLBACK');
+        return null;
+      }
+      const result = await client.query(
+        `UPDATE antena_screen_sessions SET status = 'active'
+         WHERE session_id = $1
+         RETURNING session_id, helper_id, receiver_id, status`,
+        [sessionId]
+      );
+      await client.query('COMMIT');
+      return result.rows[0] || null;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async endScreenSession({ sessionId, deviceId, reason = 'ended' }) {
+    const result = await this.pool.query(
+      `UPDATE antena_screen_sessions
+       SET status = 'ended', ended_reason = $3
+       WHERE session_id = $1 AND $2 IN (helper_id, receiver_id)
+         AND status IN ('pending', 'accepted', 'active')
+       RETURNING session_id, helper_id, receiver_id, status, ended_reason`,
+      [sessionId, deviceId, reason]
+    );
+    return result.rows[0] || null;
+  }
+
+  async getScreenSessionForParticipant(sessionId, deviceId) {
+    const result = await this.pool.query(
+      `SELECT s.session_id, s.helper_id, s.receiver_id, s.status
+       FROM antena_screen_sessions s
+       JOIN antena_assistance_requests a ON a.request_id = s.assistance_request_id
+       JOIN antena_trusted_devices t
+         ON t.owner_id = s.receiver_id AND t.helper_id = s.helper_id
+       WHERE s.session_id = $1 AND $2 IN (s.helper_id, s.receiver_id)
+         AND s.status IN ('accepted', 'active') AND s.expires_at > NOW()
+         AND a.status = 'accepted'
+         AND a.helper_id = s.helper_id AND a.receiver_id = s.receiver_id`,
+      [sessionId, deviceId]
+    );
+    return result.rows[0] || null;
+  }
+
+  async getActiveScreenSession(sessionId) {
+    const result = await this.pool.query(
+      `SELECT s.session_id, s.helper_id, s.receiver_id, s.status
+       FROM antena_screen_sessions s
+       JOIN antena_assistance_requests a ON a.request_id = s.assistance_request_id
+       JOIN antena_trusted_devices t
+         ON t.owner_id = s.receiver_id AND t.helper_id = s.helper_id
+       WHERE s.session_id = $1 AND s.status = 'active' AND s.expires_at > NOW()
+         AND a.status = 'accepted'
+         AND a.helper_id = s.helper_id AND a.receiver_id = s.receiver_id`,
+      [sessionId]
+    );
+    return result.rows[0] || null;
+  }
+
+  async endScreenSessionsForDevice(deviceId) {
+    const result = await this.pool.query(
+      `UPDATE antena_screen_sessions
+       SET status = 'ended', ended_reason = 'disconnected'
+       WHERE $1 IN (helper_id, receiver_id)
+         AND status IN ('pending', 'accepted', 'active')
+       RETURNING session_id, helper_id, receiver_id, status, ended_reason`,
+      [deviceId]
+    );
+    return result.rows;
+  }
+
   async pruneExpired() {
     await this.pool.query('DELETE FROM antena_auth_challenges WHERE expires_at <= NOW() OR consumed_at IS NOT NULL');
     await this.pool.query('DELETE FROM antena_access_sessions WHERE expires_at <= NOW()');
@@ -349,6 +563,13 @@ class PostgresStore {
       `UPDATE antena_assistance_requests SET status = 'expired'
        WHERE status = 'pending' AND expires_at <= NOW()`
     );
+    const ended = await this.pool.query(
+      `UPDATE antena_screen_sessions
+       SET status = 'expired', ended_reason = 'expired'
+       WHERE status IN ('pending', 'accepted', 'active') AND expires_at <= NOW()
+       RETURNING session_id, helper_id, receiver_id, status, ended_reason`
+    );
+    return ended.rows;
   }
 }
 
